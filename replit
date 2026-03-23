@@ -1,0 +1,5 @@
+run = "node server.js"
+entrypoint = "server.js"
+
+[nix]
+channel = "stable-23_11"
