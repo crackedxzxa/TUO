@@ -19,7 +19,8 @@ app.use((req, res, next) => {
 });
 
 // ── Constants ────────────────────────────────────────────────────────────────
-const USERS_FILE    = path.join(__dirname, 'users.json');
+const DATA_DIR      = '/app/data';
+const USERS_FILE    = path.join(DATA_DIR, 'users.json');
 const SESSION_TTL   = 4  * 60 * 60 * 1000;  // 4 hours (normal session)
 const REMEMBER_TTL  = 30 * 24 * 60 * 60 * 1000; // 30 days (remember me)
 
@@ -249,7 +250,23 @@ app.post('/admin/users/:username/force-logout', requireMaster, (req, res) => {
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get('/', (req, res) => res.json({ status: 'TUO Auth Server running', ts: Date.now() }));
 
+// ── Startup: ensure persistent data directory exists ─────────────────────────
+// Create /app/data if the mounted volume doesn't already have it, then seed
+// users.json from the repo template if no persistent copy exists yet.
+fs.mkdirSync(DATA_DIR, { recursive: true });
+if (!fs.existsSync(USERS_FILE)) {
+  const seed = path.join(__dirname, 'users.json');
+  if (fs.existsSync(seed)) {
+    fs.copyFileSync(seed, USERS_FILE);
+    console.log(`[startup] Seeded ${USERS_FILE} from repo template.`);
+  } else {
+    fs.writeFileSync(USERS_FILE, '[]');
+    console.log(`[startup] Created empty ${USERS_FILE}.`);
+  }
+}
+
 app.listen(PORT, () => {
   console.log(`TUO Auth Server listening on port ${PORT}`);
   console.log(`Master user: ${MASTER.username}`);
+  console.log(`User data stored at: ${USERS_FILE}`);
 });
