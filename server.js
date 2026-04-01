@@ -43,6 +43,9 @@ function getIp(req) {
     || req.socket.remoteAddress
     || 'unknown';
 }
+function todayKey() {
+  return new Date().toISOString().slice(0, 10); // 'YYYY-MM-DD'
+}
 
 // ── User persistence ─────────────────────────────────────────────────────────
 function loadUsers() {
@@ -58,6 +61,37 @@ function saveUsers(users) {
 // token → { username, ip, lastSeen, rememberMe, role }
 const sessions = {};
 
+// ── In-memory analytics (resets on server restart) ───────────────────────────
+// dailyOpens:        { 'YYYY-MM-DD': { username: count } }
+// dailyDevices:      { 'YYYY-MM-DD': { username: Set<ip> } }
+// dailyDeniedLogins: { 'YYYY-MM-DD': { username: count } }
+// tamperAlerts:      [ { username, ip, ts, reason } ]
+const dailyOpens        = {};
+const dailyDevices      = {};
+const dailyDeniedLogins = {};
+const tamperAlerts      = [];
+
+function trackOpen(username, ip) {
+  const day = todayKey();
+  if (!dailyOpens[day]) dailyOpens[day] = {};
+  dailyOpens[day][username] = (dailyOpens[day][username] || 0) + 1;
+  if (!dailyDevices[day]) dailyDevices[day] = {};
+  if (!dailyDevices[day][username]) dailyDevices[day][username] = new Set();
+  dailyDevices[day][username].add(ip);
+}
+
+function trackDeniedLogin(username) {
+  const day = todayKey();
+  if (!dailyDeniedLogins[day]) dailyDeniedLogins[day] = {};
+  dailyDeniedLogins[day][username] = (dailyDeniedLogins[day][username] || 0) + 1;
+}
+
+function addTamperAlert(username, ip, reason) {
+  tamperAlerts.push({ username, ip, ts: Date.now(), reason });
+  if (tamperAlerts.length > 200) tamperAlerts.splice(0, tamperAlerts.length - 200);
+  console.log(`[TAMPER ALERT] ${username} from ${ip}: ${reason}`);
+}
+
 function cleanSessions() {
   const now = Date.now();
   for (const tok of Object.keys(sessions)) {
@@ -67,6 +101,16 @@ function cleanSessions() {
   }
 }
 setInterval(cleanSessions, 60 * 1000);
+
+// Clean old analytics data (keep only last 7 days)
+setInterval(() => {
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - 7);
+  const cutoffKey = cutoff.toISOString().slice(0, 10);
+  for (const day of Object.keys(dailyOpens))        if (day < cutoffKey) delete dailyOpens[day];
+  for (const day of Object.keys(dailyDevices))       if (day < cutoffKey) delete dailyDevices[day];
+  for (const day of Object.keys(dailyDeniedLogins))  if (day < cutoffKey) delete dailyDeniedLogins[day];
+}, 60 * 60 * 1000);
 
 function sessionsForUser(username) {
   cleanSessions();
@@ -126,6 +170,7 @@ app.post('/auth/login', (req, res) => {
     cleanSessions();
     const existing = Object.values(sessions).find(s => s.username === username);
     if (existing && existing.ip !== ip) {
+      trackDeniedLogin(username);
       return res.status(403).json({
         error: 'Already signed in from another device. Sign out there first, or ask the admin to kick your session.'
       });
@@ -133,6 +178,9 @@ app.post('/auth/login', (req, res) => {
     // Remove stale sessions for this user before issuing a new one
     revokeUser(username);
   }
+
+  // Track this open / device
+  trackOpen(username, ip);
 
   const token = randToken();
   sessions[token] = { username, ip, lastSeen: Date.now(), rememberMe: !!rememberMe, role };
@@ -161,6 +209,9 @@ app.post('/auth/verify', requireAuth, (req, res) => {
   // Update IP for remembered sessions (mobile networks change IP)
   if (session.rememberMe) session.ip = ip;
 
+  // Track device IP on heartbeat/verify
+  trackOpen(session.username, ip);
+
   res.json({ username: session.username, role: session.role });
 });
 
@@ -174,12 +225,32 @@ app.post('/auth/logout', (req, res) => {
   res.json({ ok: true });
 });
 
+// POST /auth/tamper — client reports tamper attempt
+app.post('/auth/tamper', requireAuth, (req, res) => {
+  const { reason } = req.body || {};
+  const ip = getIp(req);
+  addTamperAlert(req.session.username, ip, reason || 'Auth overlay removed or modified');
+  res.json({ ok: true });
+});
+
+// POST /auth/integrity — lightweight check that the client calls frequently
+// If the server doesn't recognise the token, the client self-destructs
+app.post('/auth/integrity', (req, res) => {
+  const token = (req.headers.authorization || '').replace('Bearer ', '').trim();
+  cleanSessions();
+  const s = sessions[token];
+  if (!s) return res.status(401).json({ ok: false });
+  s.lastSeen = Date.now();
+  res.json({ ok: true });
+});
+
 // ── Admin routes (master only) ────────────────────────────────────────────────
 
-// GET /admin/users — list all users with online status
+// GET /admin/users — list all users with online status + analytics
 app.get('/admin/users', requireMaster, (req, res) => {
   cleanSessions();
   const users = loadUsers();
+  const day = todayKey();
 
   // Build a map of active sessions per user
   const online = {};
@@ -188,11 +259,20 @@ app.get('/admin/users', requireMaster, (req, res) => {
   }
 
   res.json(users.map(u => ({
-    username:  u.username,
-    active:    u.active !== false,
-    createdAt: u.createdAt,
-    session:   online[u.username] || null
+    username:        u.username,
+    active:          u.active !== false,
+    createdAt:       u.createdAt,
+    session:         online[u.username] || null,
+    opensToday:      (dailyOpens[day] && dailyOpens[day][u.username]) || 0,
+    devicesToday:    (dailyDevices[day] && dailyDevices[day][u.username])
+                       ? dailyDevices[day][u.username].size : 0,
+    deniedToday:     (dailyDeniedLogins[day] && dailyDeniedLogins[day][u.username]) || 0
   })));
+});
+
+// GET /admin/alerts — tamper alerts for admin
+app.get('/admin/alerts', requireMaster, (req, res) => {
+  res.json(tamperAlerts.slice(-50).reverse());
 });
 
 // POST /admin/users — create a new user
@@ -251,8 +331,6 @@ app.post('/admin/users/:username/force-logout', requireMaster, (req, res) => {
 app.get('/', (req, res) => res.json({ status: 'TUO Auth Server running', ts: Date.now() }));
 
 // ── Startup: ensure persistent data directory exists ─────────────────────────
-// Create /app/data if the mounted volume doesn't already have it, then seed
-// users.json from the repo template if no persistent copy exists yet.
 fs.mkdirSync(DATA_DIR, { recursive: true });
 if (!fs.existsSync(USERS_FILE)) {
   const seed = path.join(__dirname, 'users.json');
